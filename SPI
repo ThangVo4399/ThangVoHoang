@@ -1,0 +1,157 @@
+#include <xc.h>
+#include <stdint.h>
+#include <avr/interrupt.h>
+#include <avr/sleep.h>
+#include <avr/io.h>
+
+#define IOCONB 0x0b
+#define GPPUB 0x0d
+#define GPINTENB 0x05
+#define IPOLB 0x03
+#define INTCAPB 0x11
+const int Debounce=10;
+volatile long    CurrentMs = 0;     //setting the currency of time in millisecond
+volatile long    CurrentTime = 0; // overflow of cur_ms
+volatile long    LastInterrupt=0; 
+volatile int FlagT0 = 0;
+
+void EnterSleep(){
+    set_sleep_mode(SLEEP_MODE_IDLE); //setting sleep mode
+    sleep_enable(); //setting the global sleep flag
+                sleep_cpu();
+                sleep_disable();//deleting the global sleep flag
+
+}
+
+void ExternalInterruptSetup() {
+    //turn off interrupt 
+    cli();
+    //button interrupt on pin 2
+    EICRA |= (1 << ISC00);
+    // set INT0 to trigger on the logic change of INTO
+    //Interrupt 0 Sense Control table
+    EIMSK |= (1 << INT0); // Turns interrupt on INT0 (T0 pin)
+    sei(); //turn on interrupt
+}
+void TimerSetup1Ms(){
+    cli();
+    TCCR2B = 0; // Turn off clock whilst configuring
+    TCCR2B = 0b00000100; // cs22-21-20 (start counter) prescale /64
+    //16MHz/(64*250)=1KHz
+    TCNT2 = 0;
+    OCR2A = 249; // value to match (0 - 249) = 250 ticks
+    TIFR2 = 0xff; // clear all existing flags
+    TIMSK2 = _BV(OCIE2A); // enable interrupt on CTC match
+    TCCR2A = 0b00000010; // WGM01 = 1, WGM00 = 0 mode 2 CTC
+    sei(); //turn on interrupt
+}
+ISR(TIMER2_COMPA_vect) {
+    // Timer 0 has reached CTC top, 1ms has passed.
+    CurrentMs++;
+    if (CurrentMs == 0) {
+        CurrentTime++;
+    }
+}
+
+
+
+
+void delay_ms(long num) {
+  long EndTime= num+CurrentMs;
+  while (EndTime<CurrentMs)
+      EnterSleep();
+}
+
+int8_t SPI_transfer(int8_t data) {
+
+    SPDR = data;
+    while ((SPSR & _BV(SPIF)) == 0) {
+        ; // wait until transfer completed
+    }
+    return SPDR;
+}
+
+void SPI_Send_Command(uint8_t reg, uint8_t data) {
+    // Send a command + byte to SPI interface
+    PORTB &= ~_BV(2); // SS enabled (low))
+    SPI_transfer(0x40);
+    SPI_transfer(reg);
+    SPI_transfer(data);
+    PORTB |= _BV(2); // SS disabled (high)
+}
+
+uint8_t SPI_Read_Command(uint8_t reg) {
+    uint8_t data;
+    // Read a command output from SPI interface
+    PORTB &= ~_BV(2); // SS enabled (low))
+    SPI_transfer(0x41);
+    SPI_transfer(reg);
+    data = SPI_transfer(0);
+    PORTB |= _BV(2); // SS disabled (high)
+    return data;
+}
+ISR(INT0_vect) {   
+    if((CurrentMs-LastInterrupt)>Debounce) //ignore bouncing button
+            FlagT0++; // flag on every change of INT0
+    SPI_Read_Command(INTCAPB); //read interrupt to clear it
+    LastInterrupt=CurrentMs;
+}
+
+void setup_SPI() {
+    DDRB = 0b00101111;
+    PORTB |= 0b00000100; // set SS signal high
+    /*
+     * Setup SPI operations
+     * See pp176-177 of the data sheet
+     */
+    SPCR = _BV(SPE) | _BV(MSTR); // set master SPI, SPI mode 0 operation
+    SPSR = 0; // clear interrupt flags and oscillator mode.
+
+    SPI_Send_Command(IOCONB, 0b01100000); // mirror interrupts, use sequential mode    
+    SPI_Send_Command(0x00, 0x00); // register IODIRA (port A data direction)
+    SPI_Send_Command(0x01, 0xf0); // register IODIRB (port B data direction)
+    SPI_Send_Command(GPPUB, 0xff); // register GPPUB (port B GPIO Pullups)
+    SPI_Send_Command(IPOLB, 0xf0); //inverse polarity
+    SPI_Send_Command(GPINTENB, 0x80); // Enable GPINTEN ? INTERRUPT-ON-CHANGE PINS on bit 7 portB
+
+}
+
+void write_LEDs(int leds) {
+    int PortA = leds & 0xff; //first LED is on bit 4
+    int PortB = ((leds >> 8) & 0xff) | 0xf0; //Last LED is on bit 12 and keep pullup resistor on
+    SPI_Send_Command(0x14, PortA); //send value to 0x14(port A address)
+    SPI_Send_Command(0x15, PortB); //send value to 0x15(port B address)
+}
+
+int main(void) {
+    ExternalInterruptSetup();
+    setup_SPI(); // set up the physical hardware
+    int delay = 1000; // 1000 -> 500 -> 250 -> 125 -> 62 -> 50
+    int posn = 0b0000000000001; // posn holds the LED that is turned on
+    write_LEDs(posn);
+    while (1) {
+        delay_ms(delay);
+        if (FlagT0 != 0) {
+            // button is pressed - check which LED is lit.
+            if (posn == 0b0000000010000) { // middle green LED
+                delay >>= 1; // make it faster
+                if (delay < 50) {
+                    delay = 50; // fastest it can go.
+                }
+                // green buzz
+            } else if ((posn & 0b0000000101000) == 0) {
+                // not one of the orange LEDs, and not the green LED, so it
+                // must be a RED LED.
+                delay = 1000;
+                // red buzz
+            }
+            EnterSleep();
+                                                    FlagT0 = 0; //clear flag  interrupt
+        }
+        posn <<= 1;
+        if (posn == 0b0001000000000000) {
+            posn = 0b0000000000001000; // back to starting posn
+        }
+        write_LEDs(posn); // update LEDs
+    }
+}
